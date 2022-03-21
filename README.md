@@ -11,7 +11,7 @@ quietly sign all files
 sbsevery /efi -k /etc/efi-keys/DB.key -c /etc/efi-keys/DB.crt
 ```
 
-verbosley sign all filess
+verbosley sign all files
 ```
 sbsevery /efi -k /etc/efi-keys/DB.key -c /etc/efi-keys/DB.crt -d
 ```
