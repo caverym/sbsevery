@@ -4,6 +4,7 @@ use std::{
     thread::{self, JoinHandle},
 };
 
+
 use jargon_args::Jargon;
 
 macro_rules! dprintln {
@@ -43,23 +44,34 @@ fn sign_everything(
     files: Vec<PathBuf>,
     key: Arc<PathBuf>,
     cert: Arc<PathBuf>,
-    _debug: bool,
+    debug: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut threads: Vec<JoinHandle<Result<(), std::io::Error>>> = Vec::new();
+
+    let fcount = if debug { files.len() } else { 0 };
 
     for file in files {
         let key = key.clone();
         let cert = cert.clone();
-        let debug = _debug.clone();
+        let debug = debug.clone();
         let handle = thread::spawn(move || sign_thread(file, key, cert, debug));
         threads.push(handle)
     }
 
+    let tcount = if debug { threads.len() } else { 0 };
+
+    let mut fails = 0;
     for thread in threads {
         if let Err(e) = thread.join() {
             println!("{:?}", e);
+            fails += 1;
         }
     }
+
+    dprintln!(debug,
+        "Pushed files:\t{}\nThreads:\t{}\nfailures:\t{}",
+        fcount, tcount, fails 
+    );
 
     Ok(())
 }
