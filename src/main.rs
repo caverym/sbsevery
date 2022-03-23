@@ -20,7 +20,7 @@
  */
 
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::ExitStatus,
     sync::mpsc::{channel, Sender},
     thread::spawn,
@@ -53,7 +53,7 @@ fn main_prog() -> Result<(), Box<dyn std::error::Error>> {
     let directories: Vec<PathBuf> = jargon.finish().iter().map(PathBuf::from).collect();
 
     let (sx, rx) = channel();
-    spawn(move || searcher(sx, directories, verbose));
+    spawn(move || searcher(&sx, directories, verbose));
 
     let mut threads = Vec::new();
 
@@ -88,9 +88,9 @@ fn main_prog() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn sign_file(
-    file: &PathBuf,
-    key: &PathBuf,
-    cert: &PathBuf,
+    file: &Path,
+    key: &Path,
+    cert: &Path,
     verbose: bool,
 ) -> Result<ExitStatus, std::io::Error> {
     dprintln!(verbose, "signing:\t{}", file.display());
@@ -109,12 +109,12 @@ fn sign_file(
     child.wait()
 }
 
-fn searcher(sx: Sender<PathBuf>, directories: Vec<PathBuf>, verbose: bool) {
+fn searcher(sx: &Sender<PathBuf>, directories: Vec<PathBuf>, verbose: bool) {
     for dir in directories {
         let err = if dir.is_dir() {
-            push_dir(&sx, dir, verbose)
+            push_dir(sx, &dir, verbose)
         } else {
-            push_file(&sx, dir, verbose)
+            push_file(sx, &dir, verbose)
         };
 
         if let Err(e) = err {
@@ -125,20 +125,18 @@ fn searcher(sx: Sender<PathBuf>, directories: Vec<PathBuf>, verbose: bool) {
 
 fn push_dir(
     sx: &Sender<PathBuf>,
-    dir: PathBuf,
+    dir: &Path,
     verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     dprintln!(verbose, "expanding:\t{}", dir.display());
-    if let Some(dir) = dir.read_dir().ok() {
+    if let Ok(dir) = dir.read_dir() {
         for entry in dir.flatten() {
-            let err = if entry.path().is_dir() {
-                push_dir(sx, entry.path(), verbose)
-            } else {
-                push_file(sx, entry.path(), verbose)
-            };
+            let entry = entry.path();
 
-            if let Err(e) = err {
-                dprintln!(verbose, "error:\t{}", e);
+            if entry.is_dir() {
+                push_dir(sx, &entry, verbose)?;
+            } else {
+                push_file(sx, &entry, verbose)?;
             }
         }
     }
@@ -148,10 +146,10 @@ fn push_dir(
 
 fn push_file(
     sx: &Sender<PathBuf>,
-    file: PathBuf,
+    file: &Path,
     verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     dprintln!(verbose, "pushing:\t{}", file.display());
-    sx.send(file)?;
+    sx.send(file.to_path_buf())?;
     Ok(())
 }
