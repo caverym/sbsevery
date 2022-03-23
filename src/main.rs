@@ -1,27 +1,29 @@
 /*!
  * # Sbsevery
- * 
+ *
  * Secure boot sign every(thing)
- * 
+ *
  * Recursively sign files for secureboot (helpful when dualbooting Windows with custom SB keys)
- * 
+ *
  * ## Usage
- * 
+ *
  * quietly sign all files
  * ```
  * sbsevery /efi -k /etc/efi-keys/DB.key -c /etc/efi-keys/DB.crt
  * ```
- * 
+ *
  * verbosely sign all files
  * ```
  * sbsevery /efi -k /etc/efi-keys/DB.key -c /etc/efi-keys/DB.crt -d
  * ```
  */
 
+#![feature(thread_is_running)]
+
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
-    thread::{self, JoinHandle},
+    sync::{mpsc::{channel, Sender}, Arc},
+    thread::{JoinHandle, spawn}, process::ExitStatus,
 };
 
 use jargon_args::Jargon;
@@ -35,72 +37,64 @@ macro_rules! dprintln {
 }
 
 fn main() {
-    if let Err(e) = prog_main() {
+    if let Err(e) = main_prog() {
         eprintln!("{}", e);
         std::process::exit(1);
     }
 }
 
-fn prog_main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut parser: Jargon = Jargon::from_env();
+fn main_prog() -> Result<(), Box<dyn std::error::Error>> {
+    let (sx, rx) = channel();
+    let (esx, erx) = channel();
 
-    let mut key: PathBuf = parser.result_arg(["-k", "--key"])?;
-    let mut cert: PathBuf = parser.result_arg(["-c", "--cert"])?;
-    let debug = parser.contains(["-d", "--debug"]);
+    let mut jargon = Jargon::from_env();
 
-    key = key.canonicalize()?;
-    cert = cert.canonicalize()?;
+    let verbose = jargon.contains(["-v", "--verbose"]);
+    let key_path: PathBuf = jargon.result_arg(["-k", "--key"])?;
+    let cert_path: PathBuf = jargon.result_arg(["-c", "--cert"])?;
 
-    let key: Arc<PathBuf> = Arc::new(key);
-    let cert: Arc<PathBuf> = Arc::new(cert);
+    let mut directories: Vec<PathBuf> = jargon
+        .finish()
+        .iter()
+        .map(|p| PathBuf::from(p))
+        .collect();
+    
+    let searcher = spawn(move || searcher(sx, esx, directories));
 
-    let files = collect_files(parser_to_vec(parser), debug)?;
+    let mut threads = Vec::new();
 
-    sign_everything(files, key, cert, debug)
-}
-
-fn sign_everything(
-    files: Vec<PathBuf>,
-    key: Arc<PathBuf>,
-    cert: Arc<PathBuf>,
-    debug: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut threads: Vec<JoinHandle<Result<(), std::io::Error>>> = Vec::new();
-
-    let fcount = if debug { files.len() } else { 0 };
-
-    for file in files {
-        let key = key.clone();
-        let cert = cert.clone();
-        let debug = debug.clone();
-        let handle = thread::spawn(move || sign_thread(file, key, cert, debug));
-        threads.push(handle)
-    }
-
-    let tcount = if debug { threads.len() } else { 0 };
-
-    let mut fails = 0;
-    for thread in threads {
-        if let Err(e) = thread.join() {
-            println!("{:?}", e);
-            fails += 1;
+    while searcher.is_running() {
+        if let Ok(path) = rx.recv() {
+            let key_path = key_path.clone();
+            let cert_path = cert_path.clone();
+            let t = spawn(move || sign_file(path, key_path, cert_path));
+            threads.push(t);
         }
     }
 
-    dprintln!(debug,
-        "Pushed files:\t{}\nThreads:\t{}\nfailures:\t{}",
-        fcount, tcount, fails 
-    );
+    let thread_count = threads.len();
+    let mut failures = 0;
+
+    for t in threads {
+        if let Ok(res) = t.join() {
+            match res {
+                Ok(status) => if !status.success() { failures += 1 },
+                Err(_) => failures += 1,
+             }
+        }
+    }
+
+    eprintln!("ran {} threads with {} failures", thread_count, failures);
 
     Ok(())
 }
 
-fn sign_thread(
+fn sign_file(
     file: PathBuf,
-    key: Arc<PathBuf>,
-    cert: Arc<PathBuf>,
-    debug: bool,
-) -> Result<(), std::io::Error> {
+    key: PathBuf,
+    cert: PathBuf,
+) -> Result<ExitStatus, std::io::Error> {
+    let debug = true;
     dprintln!(debug, "signing: {}", file.display());
 
     let mut child = std::process::Command::new("sbsign")
@@ -114,55 +108,32 @@ fn sign_thread(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()?;
-    child.wait()?;
-    Ok(())
+    child.wait()
 }
 
-fn parser_to_vec(parser: Jargon) -> Vec<PathBuf> {
-    parser.finish().iter().map(|p| PathBuf::from(p)).collect()
-}
-
-fn collect_files(
-    paths: Vec<PathBuf>,
-    debug: bool,
-) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
-    let mut result = Vec::new();
-    for path in paths {
-        match path.is_file() {
-            true => push_file(&mut result, &path, debug)?,
-            false => push_dir(&mut result, &path, debug)?,
+fn searcher(sx: Sender<PathBuf>, esx: Sender<bool>, directories: Vec<PathBuf>) {
+    for dir in directories {
+        match dir.is_dir() {
+            true => push_dir(&sx, dir),
+            false => push_file(&sx, dir),
         }
     }
-
-    Ok(result)
 }
 
-fn push_file(
-    result: &mut Vec<PathBuf>,
-    path: &Path,
-    debug: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let path = path.canonicalize()?;
-    dprintln!(debug, "pushing: {}", path.display());
-    result.push(path);
-    Ok(())
-}
-
-fn push_dir(
-    result: &mut Vec<PathBuf>,
-    path: &Path,
-    debug: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let path = path.canonicalize()?;
-    dprintln!(debug, "expanding: {}", path.display());
-    let paths = path.read_dir()?;
-    for path in paths {
-        let path = path?.path();
-        match path.is_file() {
-            true => push_file(result, &path, debug)?,
-            false => push_dir(result, &path, debug)?,
+fn push_dir(sx: &Sender<PathBuf>, dir: PathBuf) {
+    if let Some(dir) = dir.read_dir().ok() {
+        for entry in dir {
+            if let Ok(entry) = entry {
+                match entry.path().is_dir() {
+                    true => push_dir(sx, entry.path()),
+                    false => push_file(sx, entry.path()),
+                }
+            }
         }
     }
+}
 
-    Ok(())
+fn push_file(sx: &Sender<PathBuf>, file: PathBuf) {
+    eprintln!("pushing: {}", file.display());
+    sx.send(file);
 }
