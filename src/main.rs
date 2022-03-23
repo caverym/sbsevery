@@ -1,3 +1,4 @@
+#![warn(clippy::all, clippy::pedantic)]
 /*!
  * # Sbsevery
  *
@@ -18,12 +19,11 @@
  * ```
  */
 
-#![feature(thread_is_running)]
-
 use std::{
     path::PathBuf,
+    process::ExitStatus,
     sync::mpsc::{channel, Sender},
-    thread::spawn, process::ExitStatus,
+    thread::spawn,
 };
 
 use jargon_args::Jargon;
@@ -50,24 +50,18 @@ fn main_prog() -> Result<(), Box<dyn std::error::Error>> {
     let key_path: PathBuf = jargon.result_arg(["-k", "--key"])?;
     let cert_path: PathBuf = jargon.result_arg(["-c", "--cert"])?;
 
-    let directories: Vec<PathBuf> = jargon
-        .finish()
-        .iter()
-        .map(|p| PathBuf::from(p))
-        .collect();
-    
+    let directories: Vec<PathBuf> = jargon.finish().iter().map(PathBuf::from).collect();
+
     let (sx, rx) = channel();
-    let searcher = spawn(move || searcher(sx, directories, verbose));
+    spawn(move || searcher(sx, directories, verbose));
 
     let mut threads = Vec::new();
 
-    while searcher.is_running() {
-        if let Ok(path) = rx.recv() {
-            let key_path = key_path.clone();
-            let cert_path = cert_path.clone();
-            let t = spawn(move || sign_file(path, key_path, cert_path, verbose));
-            threads.push(t);
-        }
+    while let Ok(file) = rx.recv() {
+        let key_path = key_path.clone();
+        let cert_path = cert_path.clone();
+        let t = spawn(move || sign_file(&file, &key_path, &cert_path, verbose));
+        threads.push(t);
     }
 
     let thread_count = threads.len();
@@ -76,21 +70,27 @@ fn main_prog() -> Result<(), Box<dyn std::error::Error>> {
     for t in threads {
         if let Ok(res) = t.join() {
             match res {
-                Ok(status) => if !status.success() { failures += 1 },
-                Err(_) => failures += 1,
-             }
+                Ok(status) => {
+                    if !status.success() {
+                        failures += 1;
+                    }
+                }
+                Err(e) => eprintln!("{}", e),
+            }
+        } else {
+            eprintln!("Thread join failed");
         }
     }
 
-    dprintln!(verbose, "ran {} threads with {} failures", thread_count, failures);
+    eprintln!("ran {} threads with {} failures", thread_count, failures);
 
     Ok(())
 }
 
 fn sign_file(
-    file: PathBuf,
-    key: PathBuf,
-    cert: PathBuf,
+    file: &PathBuf,
+    key: &PathBuf,
+    cert: &PathBuf,
     verbose: bool,
 ) -> Result<ExitStatus, std::io::Error> {
     dprintln!(verbose, "signing:\t{}", file.display());
@@ -111,9 +111,10 @@ fn sign_file(
 
 fn searcher(sx: Sender<PathBuf>, directories: Vec<PathBuf>, verbose: bool) {
     for dir in directories {
-        let err = match dir.is_dir() {
-            true => push_dir(&sx, dir, verbose),
-            false => push_file(&sx, dir, verbose),
+        let err = if dir.is_dir() {
+            push_dir(&sx, dir, verbose)
+        } else {
+            push_file(&sx, dir, verbose)
         };
 
         if let Err(e) = err {
@@ -122,19 +123,22 @@ fn searcher(sx: Sender<PathBuf>, directories: Vec<PathBuf>, verbose: bool) {
     }
 }
 
-fn push_dir(sx: &Sender<PathBuf>, dir: PathBuf, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn push_dir(
+    sx: &Sender<PathBuf>,
+    dir: PathBuf,
+    verbose: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     dprintln!(verbose, "expanding:\t{}", dir.display());
     if let Some(dir) = dir.read_dir().ok() {
-        for entry in dir {
-            if let Ok(entry) = entry {
-                let err = match entry.path().is_dir() {
-                    true => push_dir(sx, entry.path(), verbose),
-                    false => push_file(sx, entry.path(), verbose),
-                };
+        for entry in dir.flatten() {
+            let err = if entry.path().is_dir() {
+                push_dir(sx, entry.path(), verbose)
+            } else {
+                push_file(sx, entry.path(), verbose)
+            };
 
-                if let Err(e) = err {
-                    dprintln!(verbose, "error:\t{}", e);
-                }
+            if let Err(e) = err {
+                dprintln!(verbose, "error:\t{}", e);
             }
         }
     }
@@ -142,7 +146,11 @@ fn push_dir(sx: &Sender<PathBuf>, dir: PathBuf, verbose: bool) -> Result<(), Box
     Ok(())
 }
 
-fn push_file(sx: &Sender<PathBuf>, file: PathBuf, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn push_file(
+    sx: &Sender<PathBuf>,
+    file: PathBuf,
+    verbose: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     dprintln!(verbose, "pushing:\t{}", file.display());
     sx.send(file)?;
     Ok(())
