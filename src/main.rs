@@ -22,8 +22,8 @@
 use std::{
     path::{Path, PathBuf},
     process::ExitStatus,
-    sync::mpsc::{channel, Sender},
-    thread::spawn,
+    sync::mpsc::{channel, Receiver, Sender},
+    thread::{spawn, JoinHandle},
 };
 
 use jargon_args::Jargon;
@@ -45,34 +45,36 @@ fn main() {
 
 fn main_prog() -> Result<(), Box<dyn std::error::Error>> {
     let mut jargon = Jargon::from_env();
-
     let verbose = jargon.contains(["-v", "--verbose"]);
     let key_path: PathBuf = jargon.result_arg(["-k", "--key"])?;
     let cert_path: PathBuf = jargon.result_arg(["-c", "--cert"])?;
-
     let directories: Vec<PathBuf> = jargon.finish().iter().map(PathBuf::from).collect();
-
     let (sx, rx) = channel();
+
     spawn(move || searcher(&sx, directories, verbose));
 
     let mut threads = Vec::new();
-
-    while let Ok(file) = rx.recv() {
-        let key_path = key_path.clone();
-        let cert_path = cert_path.clone();
-        let t = spawn(move || sign_file(&file, &key_path, &cert_path, verbose));
-        threads.push(t);
-    }
+    threader(&rx, &key_path, &cert_path, &mut threads, verbose);
 
     let thread_count = threads.len();
     let mut failures = 0;
+    wait(threads, &mut failures);
 
+    eprintln!("ran {} threads with {} failures", thread_count, failures);
+
+    Ok(())
+}
+
+fn wait(
+    threads: Vec<std::thread::JoinHandle<Result<ExitStatus, std::io::Error>>>,
+    failures: &mut i32,
+) {
     for t in threads {
         if let Ok(res) = t.join() {
             match res {
                 Ok(status) => {
                     if !status.success() {
-                        failures += 1;
+                        *failures += 1;
                     }
                 }
                 Err(e) => eprintln!("{}", e),
@@ -81,10 +83,21 @@ fn main_prog() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("Thread join failed");
         }
     }
+}
 
-    eprintln!("ran {} threads with {} failures", thread_count, failures);
-
-    Ok(())
+fn threader(
+    rx: &Receiver<PathBuf>,
+    key_path: &Path,
+    cert_path: &Path,
+    threads: &mut Vec<JoinHandle<Result<ExitStatus, std::io::Error>>>,
+    verbose: bool,
+) {
+    while let Ok(file) = rx.recv() {
+        let key_path = key_path.to_path_buf();
+        let cert_path = cert_path.to_path_buf();
+        let t = spawn(move || sign_file(&file, &key_path, &cert_path, verbose));
+        threads.push(t);
+    }
 }
 
 fn sign_file(
