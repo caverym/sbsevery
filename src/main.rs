@@ -21,9 +21,9 @@
 #![feature(thread_is_running)]
 
 use std::{
-    path::{Path, PathBuf},
-    sync::{mpsc::{channel, Sender}, Arc},
-    thread::{JoinHandle, spawn}, process::ExitStatus,
+    path::PathBuf,
+    sync::mpsc::{channel, Sender},
+    thread::spawn, process::ExitStatus,
 };
 
 use jargon_args::Jargon;
@@ -44,22 +44,20 @@ fn main() {
 }
 
 fn main_prog() -> Result<(), Box<dyn std::error::Error>> {
-    let (sx, rx) = channel();
-    let (esx, erx) = channel();
-
     let mut jargon = Jargon::from_env();
 
     let verbose = jargon.contains(["-v", "--verbose"]);
     let key_path: PathBuf = jargon.result_arg(["-k", "--key"])?;
     let cert_path: PathBuf = jargon.result_arg(["-c", "--cert"])?;
 
-    let mut directories: Vec<PathBuf> = jargon
+    let directories: Vec<PathBuf> = jargon
         .finish()
         .iter()
         .map(|p| PathBuf::from(p))
         .collect();
     
-    let searcher = spawn(move || searcher(sx, esx, directories));
+    let (sx, rx) = channel();
+    let searcher = spawn(move || searcher(sx, directories, verbose));
 
     let mut threads = Vec::new();
 
@@ -67,7 +65,7 @@ fn main_prog() -> Result<(), Box<dyn std::error::Error>> {
         if let Ok(path) = rx.recv() {
             let key_path = key_path.clone();
             let cert_path = cert_path.clone();
-            let t = spawn(move || sign_file(path, key_path, cert_path));
+            let t = spawn(move || sign_file(path, key_path, cert_path, verbose));
             threads.push(t);
         }
     }
@@ -84,7 +82,7 @@ fn main_prog() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    eprintln!("ran {} threads with {} failures", thread_count, failures);
+    dprintln!(verbose, "ran {} threads with {} failures", thread_count, failures);
 
     Ok(())
 }
@@ -93,9 +91,9 @@ fn sign_file(
     file: PathBuf,
     key: PathBuf,
     cert: PathBuf,
+    verbose: bool,
 ) -> Result<ExitStatus, std::io::Error> {
-    let debug = true;
-    dprintln!(debug, "signing: {}", file.display());
+    dprintln!(verbose, "signing:\t{}", file.display());
 
     let mut child = std::process::Command::new("sbsign")
         .arg("--key")
@@ -111,29 +109,41 @@ fn sign_file(
     child.wait()
 }
 
-fn searcher(sx: Sender<PathBuf>, esx: Sender<bool>, directories: Vec<PathBuf>) {
+fn searcher(sx: Sender<PathBuf>, directories: Vec<PathBuf>, verbose: bool) {
     for dir in directories {
-        match dir.is_dir() {
-            true => push_dir(&sx, dir),
-            false => push_file(&sx, dir),
+        let err = match dir.is_dir() {
+            true => push_dir(&sx, dir, verbose),
+            false => push_file(&sx, dir, verbose),
+        };
+
+        if let Err(e) = err {
+            dprintln!(verbose, "error:\t{}", e);
         }
     }
 }
 
-fn push_dir(sx: &Sender<PathBuf>, dir: PathBuf) {
+fn push_dir(sx: &Sender<PathBuf>, dir: PathBuf, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+    dprintln!(verbose, "expanding:\t{}", dir.display());
     if let Some(dir) = dir.read_dir().ok() {
         for entry in dir {
             if let Ok(entry) = entry {
-                match entry.path().is_dir() {
-                    true => push_dir(sx, entry.path()),
-                    false => push_file(sx, entry.path()),
+                let err = match entry.path().is_dir() {
+                    true => push_dir(sx, entry.path(), verbose),
+                    false => push_file(sx, entry.path(), verbose),
+                };
+
+                if let Err(e) = err {
+                    dprintln!(verbose, "error:\t{}", e);
                 }
             }
         }
     }
+
+    Ok(())
 }
 
-fn push_file(sx: &Sender<PathBuf>, file: PathBuf) {
-    eprintln!("pushing: {}", file.display());
-    sx.send(file);
+fn push_file(sx: &Sender<PathBuf>, file: PathBuf, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+    dprintln!(verbose, "pushing:\t{}", file.display());
+    sx.send(file)?;
+    Ok(())
 }
